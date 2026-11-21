@@ -200,6 +200,11 @@ details.more{margin:6px 0 12px} details.more summary{cursor:pointer;font-weight:
           <div class="bar"><i id="mBar"></i></div>
           <p class="note" style="margin-top:6px" id="mNow">Waiting to start</p>
         </div>
+        <div class="card" style="margin-top:12px;padding:12px 14px">
+          <div style="display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;align-items:center"><b>Task queue</b><button class="btn sm" id="qclear">Clear finished</button></div>
+          <p class="note" style="margin:4px 0 8px">Tasks run one at a time, in order. Pause and cancel take effect before the next Claude call, so the call in progress finishes first. Tasks run in a background worker, so they keep going if you reload the page or restart the app; this list comes back when you reopen it.</p>
+          <div id="queue" aria-live="polite"></div>
+        </div>
         <div class="log" id="log" aria-live="polite"></div>
         <div id="runresult"></div>
         <div class="actions"><button class="btn" data-go="2">Back</button><button class="btn primary" id="toReview" disabled>Review the papers</button></div>
@@ -356,15 +361,18 @@ details.more{margin:6px 0 12px} details.more summary{cursor:pointer;font-weight:
   function alert_(m){$('#banners').innerHTML='<div class="banner">'+esc(m)+'</div>'}
 
   /* ---------- jobs ---------- */
+  var pollSeq=0;
   function pollJob(id,logEl,onDone,spend){
-    var since=0,timer=null;
+    var since=0,timer=null,mine=++pollSeq;
     function tick(){
+      if(mine!==pollSeq)return;
       api('/api/job?id='+id+'&since='+since).then(function(j){
+        if(mine!==pollSeq)return;
         j.lines.forEach(function(l){var d=document.createElement('div');d.textContent=l;
           if(/FAIL|failed|needs a human/i.test(l))d.className='y';else if(/saved out|PASS|^Found/i.test(l.trim()))d.className='g';logEl.appendChild(d)});
         since=j.total;logEl.scrollTop=logEl.scrollHeight;
         if(spend)spend(j);
-        if(j.status==='running'){timer=setTimeout(tick,1000)}else{refreshStatus();onDone(j)}
+        if(j.status==='running'||j.status==='queued'||j.status==='paused'){timer=setTimeout(tick,1000)}else{refreshStatus();onDone(j)}
       }).catch(function(e){onDone({status:'error',error:e.message,lines:[]})});
     }
     tick();
@@ -387,6 +395,29 @@ details.more{margin:6px 0 12px} details.more summary{cursor:pointer;font-weight:
     $('#rstat').innerHTML='<span class="pill ok">Pattern ready</span>';
     S.done[1]=true;$('#toGap').disabled=false;$('#reresearch').disabled=false;
   }
+  function attachResearch(jobId,b){
+    $('#rbody').innerHTML='';$('#toGap').disabled=true;$('#reresearch').disabled=true;
+    var log=$('#rlog');log.innerHTML='';log.hidden=false;
+    $('#rtitle').textContent='Research: '+b.company+', '+b.role;$('#rsub').textContent='';
+    $('#rstat').innerHTML='<span class="pill info">Working</span>';
+    go(1);
+    pollJob(jobId,log,function(j){
+      if(j.status==='cancelled'){$('#rstat').innerHTML='<span class="pill warn">Cancelled</span>';$('#reresearch').disabled=false;return}
+      if(j.status==='error'){$('#rstat').innerHTML='<span class="pill bad">Failed</span>';fail($('#rbody'),j.error);$('#reresearch').disabled=false;return}
+      showPattern(j.result);
+    });
+  }
+  /* A job keeps running on the server when the page is reloaded or another task is started: pick it up again. */
+  function resumeActive(quiet){
+    return api('/api/app').then(function(a){
+      var j=a.activeJob;if(!j)return false;
+      var m=j.meta||{};
+      if(m.company)$('#co').value=m.company;if(m.role)$('#ro').value=m.role;
+      if(!quiet)alert_('A '+j.kind+' task is running. Showing it here.');
+      if(j.kind==='generate')attachRun(j.id,m.papers||1);else attachResearch(j.id,{company:m.company||'',role:m.role||''});
+      return true;
+    }).catch(function(){return false});
+  }
   function startResearch(refresh){
     var b=brief();
     $('#rbody').innerHTML='';$('#toGap').disabled=true;$('#reresearch').disabled=true;
@@ -398,10 +429,7 @@ details.more{margin:6px 0 12px} details.more summary{cursor:pointer;font-weight:
       if(p){log.hidden=true;showPattern(p);return}
       log.hidden=false;
       api('/api/research',{company:b.company,role:b.role,refresh:refresh}).then(function(r){
-        pollJob(r.job,log,function(j){
-          if(j.status==='error'){$('#rstat').innerHTML='<span class="pill bad">Failed</span>';fail($('#rbody'),j.error);$('#reresearch').disabled=false;return}
-          showPattern(j.result);
-        });
+        attachResearch(r.job,b);refreshQueue();
       }).catch(function(e){$('#rstat').innerHTML='<span class="pill bad">Failed</span>';fail($('#rbody'),e);$('#reresearch').disabled=false});
     });
   }
@@ -444,29 +472,62 @@ details.more{margin:6px 0 12px} details.more summary{cursor:pointer;font-weight:
   $$('#oCoding,#oMedia,#oWriting,#oWeb,#np').forEach(function(x){x.addEventListener('change',function(){if(S.cur===2)loadGap()})});
 
   /* ---------- 4 run ---------- */
+  function attachRun(jobId,papers){
+    go(3);S.done[2]=true;
+    $('#log').innerHTML='';$('#runresult').innerHTML='';$('#toReview').disabled=true;
+    $('#runstat').innerHTML='<span class="pill info">Running</span>';$('#runtitle').textContent='Generating '+papers+' paper(s)';
+    pollJob(jobId,$('#log'),function(j){
+      if(j.status==='cancelled'){$('#runstat').innerHTML='<span class="pill warn">Cancelled</span>';$('#runsub').textContent='Anything finished before the cancel is saved in out/.';api('/api/drafts').then(function(d){S.keys=d.drafts;$('#toReview').disabled=!d.drafts.length});return}
+      if(j.status==='error'){$('#runstat').innerHTML='<span class="pill bad">Stopped</span>';fail($('#runresult'),j.error);$('#runsub').textContent='Finished work is saved in out/. Fix the problem and run again.';
+        api('/api/drafts').then(function(d){S.keys=d.drafts;$('#toReview').disabled=!d.drafts.length});return}
+      S.keys=j.result.keys;S.done[3]=true;
+      $('#runstat').innerHTML='<span class="pill ok">Done</span>';
+      $('#runresult').innerHTML='<div class="card" style="margin-top:12px;border-color:var(--ok);background:var(--ok-soft)"><b>'+j.result.keys.length+' draft paper(s) saved</b><div class="mono" style="margin-top:4px">'+j.result.keys.map(esc).join('<br>')+'</div>'+(j.result.needsHuman.some(function(n){return n>0})?'<p class="note" style="margin-top:6px">Some questions are flagged "needs a human". They were left out of the paper; see the review screen.</p>':'')+'</div>';
+      $('#toReview').disabled=false;$('#mNow').textContent='Finished';$('#mBar').style.width='100%';
+    },function(j){
+      $('#runstat').innerHTML=j.status==='paused'?'<span class="pill warn">Paused</span>':j.status==='queued'?'<span class="pill mute">Waiting in queue</span>':'<span class="pill info">Running</span>';
+      $('#mCost').textContent=tok(j.spentTokens);var cap=S.app?S.app.capTokens:3000000;$('#mBar').style.width=Math.min(100,j.spentTokens/cap*100)+'%';
+      var last=j.lines.length?j.lines[j.lines.length-1]:null;if(last)$('#mNow').textContent=last.trim().slice(0,120);
+    });
+  }
   $('#lock').addEventListener('click',function(){
     var b=brief(),capEl=$('#cap');
     var body={company:b.company,role:b.role,papers:b.papers,split:b.split,missing:S.missing,web:b.web,coding:b.coding,media:b.media,writing:b.writing,tree:b.tree,round:b.round};
     if(capEl)body.capTokens=+capEl.value;
     $('#lock').disabled=true;
-    api('/api/run',body).then(function(r){
-      go(3);S.done[2]=true;
-      $('#log').innerHTML='';$('#runresult').innerHTML='';$('#toReview').disabled=true;
-      $('#runstat').innerHTML='<span class="pill info">Running</span>';$('#runtitle').textContent='Generating '+b.papers+' paper(s)';
-      pollJob(r.job,$('#log'),function(j){
-        if(j.status==='error'){$('#runstat').innerHTML='<span class="pill bad">Stopped</span>';fail($('#runresult'),j.error);$('#runsub').textContent='Finished work is saved in out/. Fix the problem and run again.';
-          api('/api/drafts').then(function(d){S.keys=d.drafts;$('#toReview').disabled=!d.drafts.length});return}
-        S.keys=j.result.keys;S.done[3]=true;
-        $('#runstat').innerHTML='<span class="pill ok">Done</span>';
-        $('#runresult').innerHTML='<div class="card" style="margin-top:12px;border-color:var(--ok);background:var(--ok-soft)"><b>'+j.result.keys.length+' draft paper(s) saved</b><div class="mono" style="margin-top:4px">'+j.result.keys.map(esc).join('<br>')+'</div>'+(j.result.needsHuman.some(function(n){return n>0})?'<p class="note" style="margin-top:6px">Some questions are flagged "needs a human". They were left out of the paper; see the review screen.</p>':'')+'</div>';
-        $('#toReview').disabled=false;$('#mNow').textContent='Finished';$('#mBar').style.width='100%';
-      },function(j){
-        $('#mCost').textContent=tok(j.spentTokens);var cap=S.app?S.app.capTokens:3000000;$('#mBar').style.width=Math.min(100,j.spentTokens/cap*100)+'%';
-        var last=j.lines.length?j.lines[j.lines.length-1]:null;if(last)$('#mNow').textContent=last.trim().slice(0,120);
-      });
-    }).catch(function(e){go(3);fail($('#runresult'),e);$('#lock').disabled=false});
+    api('/api/run',body).then(function(r){attachRun(r.job,b.papers);refreshQueue()}).catch(function(e){go(3);fail($('#runresult'),e);$('#lock').disabled=false});
   });
   $('#toReview').addEventListener('click',function(){go(4)});
+
+  /* ---------- task queue ---------- */
+  function jobLabel(j){var m=j.meta||{};return (j.kind==='generate'?'Generate '+(m.papers||1)+' paper(s)':'Research')+': '+(m.company||'')+', '+(m.role||'')}
+  var QPILL={queued:['mute','Waiting'],held:['warn','On hold'],running:['info','Running'],paused:['warn','Paused'],done:['ok','Done'],error:['bad','Failed'],cancelled:['warn','Cancelled']};
+  function qbtn(act,id,label,extra){return '<button class="btn sm" data-q="'+act+'" data-id="'+id+'"'+(extra?' '+extra:'')+'>'+label+'</button>'}
+  function renderQueue(list){
+    var el=$('#queue');if(!el)return;
+    if(!list.length){el.innerHTML='<p class="note">No tasks yet. Research and Generate add tasks here.</p>';return}
+    el.innerHTML=list.map(function(j){
+      var pl=QPILL[j.status]||['mute',j.status],b=[];
+      if(j.status==='running'){b.push(qbtn('pause',j.id,j.pauseRequested?'Pausing...':'Pause',j.pauseRequested?'disabled':''),qbtn('cancel',j.id,j.cancelRequested?'Cancelling...':'Cancel',j.cancelRequested?'disabled':''))}
+      if(j.status==='paused'){b.push(qbtn('resume',j.id,'Resume'),qbtn('cancel',j.id,j.cancelRequested?'Cancelling...':'Cancel',j.cancelRequested?'disabled':''))}
+      if(j.status==='queued'){b.push(qbtn('pause',j.id,'Hold'),qbtn('move-1',j.id,'&uarr;'),qbtn('move1',j.id,'&darr;'),qbtn('cancel',j.id,'Remove'))}
+      if(j.status==='held'){b.push(qbtn('resume',j.id,'Release'),qbtn('move-1',j.id,'&uarr;'),qbtn('move1',j.id,'&darr;'),qbtn('cancel',j.id,'Remove'))}
+      b.push(qbtn('watch',j.id,'View log'));
+      return '<div class="row" style="justify-content:space-between;gap:8px;padding:6px 0;border-top:1px solid var(--line)"><div><span class="pill '+pl[0]+'">'+pl[1]+'</span> '+esc(jobLabel(j))+(j.error?'<div class="note">'+esc(j.error)+'</div>':'')+'</div><div class="row" style="gap:4px">'+b.join('')+'</div></div>';
+    }).join('');
+  }
+  var qList=[];
+  function refreshQueue(){api('/api/jobs').then(function(r){qList=r.jobs;renderQueue(qList)}).catch(function(){})}
+  $('#queue').addEventListener('click',function(e){
+    var t=e.target.closest('button[data-q]');if(!t||t.disabled)return;
+    var act=t.dataset.q,id=t.dataset.id;
+    if(act==='watch'){var j=qList.filter(function(x){return x.id===id})[0];if(!j)return;
+      if(j.kind==='generate')attachRun(id,(j.meta||{}).papers||1);else attachResearch(id,{company:(j.meta||{}).company||'',role:(j.meta||{}).role||''});return}
+    var url=act.indexOf('move')===0?'/api/jobs/move':'/api/jobs/'+act,body=act.indexOf('move')===0?{id:id,delta:+act.slice(4)}:{id:id};
+    api(url,body).then(function(r){qList=r.jobs;renderQueue(qList)}).catch(function(err){alert_(err.message)});
+  });
+  $('#qclear').addEventListener('click',function(){api('/api/jobs/clear',{}).then(function(r){qList=r.jobs;renderQueue(qList)}).catch(function(err){alert_(err.message)})});
+  refreshQueue();setInterval(function(){if(!document.hidden)refreshQueue()},2000);
 
   /* ---------- 5 review ---------- */
   function openReview(){
@@ -543,6 +604,7 @@ details.more{margin:6px 0 12px} details.more summary{cursor:pointer;font-weight:
   });
 
   setPreset('medium');renderSide(0);refreshStatus();
+  resumeActive(true);
   setInterval(refreshStatus,15000);
 })();
 </script>

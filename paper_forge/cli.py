@@ -287,6 +287,13 @@ def cmd_review(args) -> int:
     return 0
 
 
+def cmd_worker(args) -> int:
+    """The background worker. The web app starts it; it keeps running when the app is restarted."""
+    from .jobs import run_worker_process
+    from .tasks import process_builder
+    return run_worker_process(load().cache_dir / "jobs", process_builder)
+
+
 def cmd_pdf(args) -> int:
     from . import review
     from .pdf import build_pdf
@@ -322,6 +329,9 @@ def main(argv=None) -> int:
     v.add_argument("--port", type=int, default=8765)
     v.add_argument("--no-browser", action="store_true")
     v.set_defaults(fn=cmd_review)
+
+    w = sub.add_parser("worker", help=argparse.SUPPRESS)
+    w.set_defaults(fn=cmd_worker)
 
     pf = sub.add_parser("pdf", help="write a question paper PDF for a draft without opening the review screen")
     pf.add_argument("key", help="draft paper key, as in out/<key>.json")

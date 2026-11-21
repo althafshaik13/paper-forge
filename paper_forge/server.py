@@ -25,7 +25,7 @@ from . import speech
 from .config import Config, load
 from .cost import CapExceeded, CostTracker
 from .estimate import counts, estimate
-from .jobs import Busy, Jobs
+from .jobs import Jobs
 from .pdf import build_pdf
 from .publish import PublishError, preview_instructions, publish
 from .research import cache_path, research
@@ -36,13 +36,29 @@ STATIC = Path(__file__).parent / "static"
 class State:
     """One cost tracker for the whole session, so the spending cap covers every click."""
 
-    def __init__(self, cfg: Config, claude_factory=None):
+    def __init__(self, cfg: Config, claude_factory=None, detached: bool = False):
         self.cfg = cfg
         self.tracker = CostTracker(cfg)
         self.lock = threading.Lock()
-        self.jobs = Jobs()
+        self.detached = detached
+        self.jobs = Jobs(cfg.cache_dir / "jobs", builder=self.build, detached=detached)
+        self.tracker.gate = self.jobs.worker.checkpoint
         self._claude = None
         self._factory = claude_factory
+
+    def spent_tokens(self) -> int:
+        """Tokens used this session. Background tasks count their own; edits made on the review screen use the app's tracker."""
+        return self.tracker.tokens + (self.jobs.tokens() if self.detached else 0)
+
+    def build(self, kind: str, spec: dict, ctl=None):
+        """Turn a task description into the function that does the work.
+
+        In the background worker process this builds a tracker and Claude client for the task. In the app process
+        (tests) it uses the app's own."""
+        from .tasks import make_task
+        if not self.detached:
+            return make_task(kind, spec, self.cfg, self.claude(), self.tracker)
+        raise RuntimeError("the app does not run tasks itself; the background worker does")
 
     def claude(self):
         if self._claude is None:
@@ -52,6 +68,9 @@ class State:
                 from .claude import make_claude
                 self._claude = make_claude(self.cfg, self.tracker)
         return self._claude
+
+    def cap_spec(self) -> dict:
+        return {"tokens": self.cfg.token_cap, "usd": self.cfg.spend_cap_usd}
 
     def set_token_cap(self, tokens: int) -> None:
         if not 10_000 <= tokens <= 100_000_000:
@@ -135,12 +154,16 @@ def make_handler(state: State):
                     cc = shutil.which("claude") is not None
                     return self._json(200, {
                         "capUsd": cfg.spend_cap_usd, "spentUsd": round(state.tracker.total, 4),
-                        "capTokens": cfg.token_cap, "spentTokens": state.tracker.tokens,
+                        "capTokens": cfg.token_cap, "spentTokens": state.spent_tokens(),
+                        "activeJob": state.jobs.active(),
                         "models": {"research": cfg.research_model, "generator": cfg.generator_model, "checker": cfg.checker_model},
                         "repo": str(cfg.repo), "repoOk": cfg.repo.is_dir(), "backend": backend,
                         "hasKey": bool(key) if backend == "api" else cc})
+                if u.path == "/api/jobs":
+                    return self._json(200, {"jobs": state.jobs.snapshot(), "spentTokens": state.spent_tokens(),
+                                            "capTokens": cfg.token_cap})
                 if u.path == "/api/job":
-                    return self._json(200, state.jobs.get(g("id"), int(g("since", "0"))) | {"spentUsd": round(state.tracker.total, 4), "spentTokens": state.tracker.tokens})
+                    return self._json(200, state.jobs.get(g("id"), int(g("since", "0"))) | {"spentUsd": round(state.tracker.total, 4), "spentTokens": state.spent_tokens()})
                 if u.path == "/api/gap":
                     return self._json(200, self._gap(cfg, g("company"), g("role"), g("split", "30/50/20"), g("missing", "dev"),
                                                      int(g("papers", "1")), g("coding", "1") == "1", g("media", "1") == "1",
@@ -148,7 +171,7 @@ def make_handler(state: State):
                 if u.path == "/api/drafts":
                     return self._json(200, {"drafts": review.list_drafts(cfg), "capUsd": cfg.spend_cap_usd,
                                             "spentUsd": round(state.tracker.total, 4),
-                                            "capTokens": cfg.token_cap, "spentTokens": state.tracker.tokens})
+                                            "capTokens": cfg.token_cap, "spentTokens": state.spent_tokens()})
                 if u.path == "/api/paper":
                     return self._json(200, review.view(cfg, g("key")))
                 if u.path == "/api/pdf":
@@ -200,26 +223,30 @@ def make_handler(state: State):
                     state.set_cap(float(body["usd"]))
                     return self._json(200, {"capUsd": state.cfg.spend_cap_usd})
 
+                if path in ("/api/jobs/pause", "/api/jobs/resume", "/api/jobs/cancel", "/api/jobs/move"):
+                    jid = str(body["id"])
+                    if path.endswith("/move"):
+                        state.jobs.move(jid, int(body.get("delta", -1)))
+                    else:
+                        getattr(state.jobs, path.rsplit("/", 1)[1])(jid)
+                    return self._json(200, {"jobs": state.jobs.snapshot()})
+                if path == "/api/jobs/clear":
+                    state.jobs.clear_finished()
+                    return self._json(200, {"jobs": state.jobs.snapshot()})
+
                 if path == "/api/research":
                     _need(body, "company", "role")
                     company, role, refresh = body["company"].strip(), body["role"].strip(), bool(body.get("refresh"))
 
-                    def job(log):
-                        log(f"Researching {company}, {role} with {cfg.research_model} and web search ...")
-                        before = state.tracker.tokens
-                        p = research(state.cfg, state.claude(), company, role, refresh=refresh)
-                        log(f"Found {len(p['sections'])} sections and {len(p.get('sources', []))} sources. "
-                            f"Used {state.tracker.tokens - before:,} tokens this step")
-                        return pattern_summary(p)
-                    return self._json(200, {"job": state.jobs.start("research", job)})
+                    spec = {"company": company, "role": role, "refresh": refresh, "cap": state.cap_spec()}
+                    return self._json(200, {"job": state.jobs.submit("research", spec, {"company": company, "role": role})})
 
                 if path == "/api/run":
                     _need(body, "company", "role")
                     company, role = body["company"].strip(), body["role"].strip()
                     pf = cache_path(cfg, company, role)
-                    if not pf.exists():
+                    if not pf.exists() and not state.jobs.has_pending("research", company=company, role=role):
                         raise FileNotFoundError("Research this company and role first")
-                    pattern = json.loads(pf.read_text(encoding="utf-8"))
                     split = _split(body.get("split", "30/50/20"))
                     opts = dict(missing=body.get("missing", "dev"), web=bool(body.get("web", True)),
                                 round_key=body.get("round") or None, tree=body.get("tree", "university"),
@@ -233,12 +260,9 @@ def make_handler(state: State):
                     if "capUsd" in body:
                         state.set_cap(float(body["capUsd"]))
 
-                    def job(log):
-                        from .pipeline import generate_papers
-                        res = generate_papers(state.cfg, state.claude(), state.tracker, pattern, split, papers, log=log, **opts)
-                        return {"keys": [r["paper"]["paperKey"] for r in res],
-                                "needsHuman": [r["report"]["needsHuman"] for r in res]}
-                    return self._json(200, {"job": state.jobs.start("generate", job)})
+                    spec = {"company": company, "role": role, "split": body.get("split", "30/50/20"), "papers": papers, "opts": opts,
+                            "cap": state.cap_spec()}
+                    return self._json(200, {"job": state.jobs.submit("generate", spec, {"company": company, "role": role, "papers": papers})})
 
                 if path == "/api/generate":          # review screen: change difficulty of chosen questions
                     key, changes = body["key"], body["changes"]
@@ -247,7 +271,7 @@ def make_handler(state: State):
                     with state.lock:
                         out = review.apply_changes(state.cfg, state.claude(), state.tracker, key, changes, log=lambda *_: None)
                     out["sessionSpentUsd"] = round(state.tracker.total, 4)
-                    out["sessionSpentTokens"] = state.tracker.tokens
+                    out["sessionSpentTokens"] = state.spent_tokens()
                     return self._json(200, out)
 
                 if path == "/api/audio":
@@ -293,8 +317,6 @@ def make_handler(state: State):
                 self._json(404, {"error": "not found"})
             except CapExceeded as e:
                 self._json(402, {"error": str(e)})
-            except Busy as e:
-                self._json(409, {"error": str(e)})
             except (PublishError, prm.PrError) as e:
                 self._json(400, {"error": str(e)})
             except (KeyError, ValueError, FileNotFoundError) as e:
@@ -306,7 +328,7 @@ def make_handler(state: State):
 
 
 def serve(port: int = 8765, open_browser: bool = True, cfg: Config | None = None) -> None:
-    state = State(cfg or load())
+    state = State(cfg or load(), detached=True)             # tasks run in a background worker that survives a restart
     srv = ThreadingHTTPServer(("127.0.0.1", port), make_handler(state))
     url = f"http://127.0.0.1:{port}/"
     print(f"Paper Forge at {url}  (Ctrl+C to stop)")

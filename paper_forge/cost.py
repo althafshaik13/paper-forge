@@ -27,6 +27,9 @@ class Call:
 class CostTracker:
     cfg: Config
     calls: list[Call] = field(default_factory=list)
+    base_tokens: int = 0                 # tokens used by other tasks, so the session cap covers all of them
+    on_add: object = None                # called after each Claude call (the worker saves the running total)
+    gate: object = None                  # called before every Claude call: lets the job queue pause or cancel the running task
 
     @property
     def total(self) -> float:
@@ -55,12 +58,16 @@ class CostTracker:
         searches = (getattr(stu, "web_search_requests", 0) or 0) if stu else 0
         call = Call(label, model, in_tok, out_tok, searches, self.price(model, in_tok, out_tok, searches))
         self.calls.append(call)
+        if self.on_add:
+            self.on_add()
         return call
 
     def check(self) -> None:
-        if self.tokens >= self.cfg.token_cap:
+        if self.gate:
+            self.gate()
+        if self.base_tokens + self.tokens >= self.cfg.token_cap:
             raise CapExceeded(
-                f"Token use {self.tokens:,} reached the cap {self.cfg.token_cap:,}. "
+                f"Token use {self.base_tokens + self.tokens:,} reached the cap {self.cfg.token_cap:,}. "
                 "Finished work is saved. Raise limits.token_cap in forge.toml to continue."
             )
         if self.total >= self.cfg.spend_cap_usd:

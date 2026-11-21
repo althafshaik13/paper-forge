@@ -32,12 +32,19 @@ Things to know:
   a few seconds longer than the API, so a full paper is slower.
 - Check Anthropic's terms for scripted use of a subscription.
 
+## Task queue (keeps running when you restart the app)
+Research and Generate go into a queue on the Run page and run one at a time in a **background worker** (`python -m paper_forge worker`,
+started for you). Restarting the app or reloading the page does not stop a task: reopen the app and the queue and the live log are
+there. Each task has Pause, Resume, Cancel (waiting tasks can also be held and moved). Pause and cancel take effect before the next
+Claude call, so the call in progress finishes first; finished work stays in `out/`. State is kept in `cache/jobs/`. If the whole
+computer restarts, a task that was running shows as interrupted and is not started again by itself (it would repeat work and spend
+tokens twice); tasks that were still waiting start by themselves the next time the app opens.
+
 ## Setup (once)
 1. Python 3.12: `winget install Python.Python.3.12`
 2. `python -m venv .venv` then `.venv\Scripts\pip install -r requirements.txt`
-3. Set `ANTHROPIC_API_KEY` (own key, billed to Anthropic). A key made for a *user* (`sk-ant-usr-...`) is not tied to a
-   workspace, so also set `ANTHROPIC_WORKSPACE_ID` to the workspace id (or create the key inside a workspace). `doctor` and the
-   app both warn about this.
+3. Set `ANTHROPIC_API_KEY` (own key, billed to Anthropic), or skip it and use your Claude plan through Claude Code
+   (see "No API key?" above).
 4. Check `forge.toml` (repo path, models, prices, spending cap).
 5. `.venv\Scripts\python -m paper_forge doctor`
 
